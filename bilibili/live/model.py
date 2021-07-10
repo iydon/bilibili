@@ -3,29 +3,43 @@
 '''
 
 
+import aiohttp
 import asyncio
 import json
 import logging
 import ssl as ssl_
 import struct
 import zlib
+
 from collections import namedtuple
 from enum import IntEnum
-# from typing import *
 from typing import Dict, Optional, Callable, Awaitable
 
-import aiohttp
+from ..conf import log_path
 
 
 logger = logging.getLogger(__name__)
+formatter = logging.Formatter('%(asctime)s - %(filename)s[line: %(lineno)d] - %(levelname)s: %(message)s')
+file_handler = logging.FileHandler(log_path)
+file_handler.setLevel(level=logging.DEBUG)
+file_handler.setFormatter(formatter)
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.INFO)
+stream_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
-ROOM_INIT_URL = 'https://api.live.bilibili.com/room/v1/Room/room_init'
-DANMAKU_SERVER_CONF_URL = 'https://api.live.bilibili.com/room/v1/Danmu/getConf'
+
+ROOM_INIT_URL = 'https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom'
+DANMAKU_SERVER_CONF_URL = 'https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo'
+DEFAULT_DANMAKU_SERVER_LIST = [
+    {'host': 'broadcastlv.chat.bilibili.com', 'port': 2243, 'wss_port': 443, 'ws_port': 2244}
+]
 
 HEADER_STRUCT = struct.Struct('>I2H2I')
 HeaderTuple = namedtuple('HeaderTuple', ('pack_len', 'raw_header_size', 'ver', 'operation', 'seq_id'))
-WS_BODY_PROTOCOL_VERSION_NORMAL = 0
-WS_BODY_PROTOCOL_VERSION_INT = 1  # 用于心跳包
+WS_BODY_PROTOCOL_VERSION_INFLATE = 0
+WS_BODY_PROTOCOL_VERSION_NORMAL = 1
 WS_BODY_PROTOCOL_VERSION_DEFLATE = 2
 
 
@@ -217,7 +231,7 @@ class GuardBuyMessage:
     def from_command(cls, data: dict):
         return cls(
             data['uid'], data['username'], data['guard_level'], data['num'], data['price'],
-            data['role_name'], data['gift_name'], data['start_time'], data['end_time']
+            data['gift_id'], data['gift_name'], data['start_time'], data['end_time']
         )
 
 
@@ -318,21 +332,12 @@ class BLiveClient:
             SuperChatDeleteMessage.from_command(command['data'])
         )
     }
-    for cmd in (  # 其他已知命令
-        '', 'ACTIVITY_BANNER_RED_NOTICE_CLOSE', 'ACTIVITY_BANNER_UPDATE_V2', 'ACTIVITY_MATCH_GIFT',
-        'ACTIVITY_RED_PACKET', 'BLOCK', 'CHANGE_ROOM_INFO', 'CLOSE', 'COMBO_END', 'COMBO_SEND',
-        'CUT_OFF', 'DAILY_QUEST_NEWDAY', 'END', 'ENTRY_EFFECT', 'GUARD_LOTTERY_START',
-        'GUARD_MSG', 'GUIARD_MSG', 'HOUR_RANK_AWARDS', 'LIVE', 'LOL_ACTIVITY',
-        'LUCK_GIFT_AWARD_USER', 'MESSAGEBOX_USER_GAIN_MEDAL', 'new_anchor_reward', 'NOTICE_MSG',
-        'PK_AGAIN', 'PK_END', 'PK_MATCH', 'PK_MIC_END', 'PK_PRE', 'PK_PROCESS', 'PK_SETTLE',
-        'PK_START', 'PREPARING', 'RAFFLE_END', 'RAFFLE_START', 'REFRESH', 'ROOM_ADMINS',
-        'room_admin_entrance', 'ROOM_BLOCK_INTO', 'ROOM_BLOCK_MSG', 'ROOM_BOX_MASTER',
-        'ROOM_CHANGE', 'ROOM_KICKOUT', 'ROOM_LIMIT', 'ROOM_LOCK', 'ROOM_RANK',
-        'ROOM_REAL_TIME_MESSAGE_UPDATE', 'ROOM_REAL_TIME_MESSAGE_UPDATE', 'ROOM_REFRESH',
-        'ROOM_SHIELD', 'ROOM_SILENT_OFF', 'ROOM_SILENT_ON', 'ROOM_SKIN_MSG', 'ROUND',
-        'SCORE_CARD', 'SEND_TOP', 'SPECIAL_GIFT', 'SUPER_CHAT_ENTRANCE',
-        'SUPER_CHAT_MESSAGE_JPN', 'SYS_GIFT', 'SYS_MSG', 'TV_END', 'TV_START', 'USER_TOAST_MSG',
-        'WARNING', 'WEEK_STAR_CLOCK', 'WELCOME', 'WELCOME_GUARD', 'WIN_ACTIVITY', 'WISH_BOTTLE'
+    # 其他常见命令
+    for cmd in (
+        'INTERACT_WORD', 'ROOM_BANNER', 'ROOM_REAL_TIME_MESSAGE_UPDATE', 'NOTICE_MSG', 'COMBO_SEND',
+        'COMBO_END', 'ENTRY_EFFECT', 'WELCOME_GUARD', 'WELCOME', 'ROOM_RANK', 'ACTIVITY_BANNER_UPDATE_V2',
+        'PANEL', 'SUPER_CHAT_MESSAGE_JPN', 'USER_TOAST_MSG', 'ROOM_BLOCK_MSG', 'LIVE', 'PREPARING',
+        'room_admin_entrance', 'ROOM_ADMINS', 'ROOM_CHANGE'
     ):
         _COMMAND_HANDLERS[cmd] = None
     del cmd
@@ -366,7 +371,7 @@ class BLiveClient:
         self._future = None
 
         if session is None:
-            self._session = aiohttp.ClientSession(loop=self._loop)
+            self._session = aiohttp.ClientSession(loop=self._loop, timeout=aiohttp.ClientTimeout(total=10))
             self._own_session = True
         else:
             self._session = session
@@ -379,6 +384,7 @@ class BLiveClient:
         # noinspection PyProtectedMember
         self._ssl = ssl if ssl else ssl_._create_unverified_context()
         self._websocket = None
+        self._heartbeat_timer_handle = None
 
     @property
     def is_running(self):
@@ -442,51 +448,78 @@ class BLiveClient:
         return self._future
 
     async def init_room(self):
+        """
+        :return: True代表没有降级，如果需要降级后还可用，重载这个函数返回True
+        """
+        res = True
+        if not await self._init_room_id_and_owner():
+            res = False
+            # 失败了则降级
+            self._room_id = self._room_short_id = self._tmp_room_id
+            self._room_owner_uid = 0
+
+        if not await self._init_host_server():
+            res = False
+            # 失败了则降级
+            self._host_server_list = DEFAULT_DANMAKU_SERVER_LIST
+            self._host_server_token = None
+        return res
+
+    async def _init_room_id_and_owner(self):
         try:
-            async with self._session.get(ROOM_INIT_URL, params={'id': self._tmp_room_id},
+            async with self._session.get(ROOM_INIT_URL, params={'room_id': self._tmp_room_id},
                                          ssl=self._ssl) as res:
                 if res.status != 200:
-                    logger.warning('room %d room_init失败：%d %s', self._tmp_room_id,
+                    logger.warning('room %d init_room失败：%d %s', self._tmp_room_id,
                                    res.status, res.reason)
                     return False
                 data = await res.json()
                 if data['code'] != 0:
-                    logger.warning('room %d room_init失败：%s', self._tmp_room_id, data['msg'])
+                    logger.warning('room %d init_room失败：%s', self._tmp_room_id, data['message'])
                     return False
                 if not self._parse_room_init(data['data']):
                     return False
-        except aiohttp.ClientConnectionError:
-            logger.exception('room %d room_init失败：', self._tmp_room_id)
-            return False
-
-        try:
-            async with self._session.get(DANMAKU_SERVER_CONF_URL, params={'room_id': self._tmp_room_id},
-                                         ssl=self._ssl) as res:
-                if res.status != 200:
-                    logger.warning('room %d getConf失败：%d %s', self._tmp_room_id,
-                                   res.status, res.reason)
-                    return False
-                data = await res.json()
-                if data['code'] != 0:
-                    logger.warning('room %d getConf失败：%s', self._tmp_room_id, data['msg'])
-                    return False
-                self._host_server_list = data['data']['host_server_list']
-                self._host_server_token = data['data']['token']
-                if not self._host_server_list:
-                    logger.warning('room %d getConf失败：host_server_list为空')
-                    return False
-        except aiohttp.ClientConnectionError:
-            logger.exception('room %d getConf失败：', self._tmp_room_id)
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            logger.exception('room %d init_room失败：', self._tmp_room_id)
             return False
         return True
 
     def _parse_room_init(self, data):
-        self._room_id = data['room_id']
-        self._room_short_id = data['short_id']
-        self._room_owner_uid = data['uid']
+        room_info = data['room_info']
+        self._room_id = room_info['room_id']
+        self._room_short_id = room_info['short_id']
+        self._room_owner_uid = room_info['uid']
         return True
 
-    def _make_packet(self, data, operation):
+    async def _init_host_server(self):
+        try:
+            async with self._session.get(DANMAKU_SERVER_CONF_URL, params={'id': self._room_id, 'type': 0},
+                                         ssl=self._ssl) as res:
+                if res.status != 200:
+                    logger.warning('room %d getConf失败：%d %s', self._room_id,
+                                   res.status, res.reason)
+                    return False
+                data = await res.json()
+                if data['code'] != 0:
+                    logger.warning('room %d getConf失败：%s', self._room_id, data['message'])
+                    return False
+                if not self._parse_danmaku_server_conf(data['data']):
+                    return False
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            logger.exception('room %d getConf失败：', self._room_id)
+            return False
+        return True
+
+    def _parse_danmaku_server_conf(self, data):
+        self._host_server_list = data['host_list']
+        self._host_server_token = data['token']
+        if not self._host_server_list:
+            logger.warning('room %d getConf失败：host_server_list为空', self._room_id)
+            return False
+        return True
+
+    @staticmethod
+    def _make_packet(data, operation):
         body = json.dumps(data).encode('utf-8')
         header = HEADER_STRUCT.pack(
             HEADER_STRUCT.size + len(body),
@@ -503,10 +536,11 @@ class BLiveClient:
             'roomid':    self._room_id,
             'protover':  2,
             'platform':  'web',
-            'clientver': '1.8.2',
-            'type':      2,
-            'key':       self._host_server_token
+            'clientver': '1.14.3',
+            'type':      2
         }
+        if self._host_server_token is not None:
+            auth_params['key'] = self._host_server_token
         await self._websocket.send_bytes(self._make_packet(auth_params, Operation.AUTH))
 
     async def _message_loop(self):
@@ -517,37 +551,34 @@ class BLiveClient:
 
         retry_count = 0
         while True:
-            heartbeat_future = None
             try:
                 # 连接
                 host_server = self._host_server_list[retry_count % len(self._host_server_list)]
                 async with self._session.ws_connect(
                     f'wss://{host_server["host"]}:{host_server["wss_port"]}/sub',
+                    receive_timeout=self._heartbeat_interval + 5,
                     ssl=self._ssl
                 ) as websocket:
                     self._websocket = websocket
                     await self._send_auth()
-                    heartbeat_future = asyncio.ensure_future(self._heartbeat_loop(), loop=self._loop)
-                    heartbeat_future.add_done_callback(
-                        lambda _future: logger.debug('room %d 心跳循环结束', self.room_id)
+                    self._heartbeat_timer_handle = self._loop.call_later(
+                        self._heartbeat_interval, self._on_send_heartbeat
                     )
 
                     # 处理消息
                     async for message in websocket:  # type: aiohttp.WSMessage
                         retry_count = 0
-                        if message.type == aiohttp.WSMsgType.BINARY:
-                            try:
-                                await self._handle_message(message.data)
-                            except BaseException as e:
-                                if type(e) in (
-                                    asyncio.CancelledError, aiohttp.ClientConnectionError,
-                                    asyncio.TimeoutError, ssl_.SSLError
-                                ):
-                                    raise
-                                logger.exception('room %d 处理消息时发生错误：', self.room_id)
-                        else:
+                        if message.type != aiohttp.WSMsgType.BINARY:
                             logger.warning('room %d 未知的websocket消息：type=%s %s', self.room_id,
                                            message.type, message.data)
+                            continue
+
+                        try:
+                            await self._handle_message(message.data)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception('room %d 处理消息时发生错误：', self.room_id)
 
             except asyncio.CancelledError:
                 break
@@ -559,13 +590,10 @@ class BLiveClient:
                 # 证书错误时无法重连
                 break
             finally:
-                if heartbeat_future is not None:
-                    heartbeat_future.cancel()
-                    try:
-                        await heartbeat_future
-                    except asyncio.CancelledError:
-                        break
                 self._websocket = None
+                if self._heartbeat_timer_handle is not None:
+                    self._heartbeat_timer_handle.cancel()
+                    self._heartbeat_timer_handle = None
 
             retry_count += 1
             logger.warning('room %d 掉线重连中%d', self.room_id, retry_count)
@@ -574,14 +602,10 @@ class BLiveClient:
             except asyncio.CancelledError:
                 break
 
-    async def _heartbeat_loop(self):
-        while True:
-            try:
-                await self._websocket.send_bytes(self._make_packet({}, Operation.HEARTBEAT))
-                await asyncio.sleep(self._heartbeat_interval)
-
-            except (asyncio.CancelledError, aiohttp.ClientConnectionError):
-                break
+    def _on_send_heartbeat(self):
+        coro = self._websocket.send_bytes(self._make_packet({}, Operation.HEARTBEAT))
+        asyncio.ensure_future(coro, loop=self._loop)
+        self._heartbeat_timer_handle = self._loop.call_later(self._heartbeat_interval, self._on_send_heartbeat)
 
     async def _handle_message(self, data):
         offset = 0
@@ -600,13 +624,13 @@ class BLiveClient:
             elif header.operation == Operation.SEND_MSG_REPLY:
                 body = data[offset + HEADER_STRUCT.size: offset + header.pack_len]
                 if header.ver == WS_BODY_PROTOCOL_VERSION_DEFLATE:
-                    body = zlib.decompress(body)
+                    body = await self._loop.run_in_executor(None, zlib.decompress, body)
                     await self._handle_message(body)
                 else:
                     try:
                         body = json.loads(body.decode('utf-8'))
                         await self._handle_command(body)
-                    except BaseException:
+                    except Exception:
                         logger.error('body: %s', body)
                         raise
 
@@ -636,6 +660,7 @@ class BLiveClient:
                 await handler(self, command)
         else:
             logger.warning('room %d 未知命令：cmd=%s %s', self.room_id, cmd, command)
+            # 只有第一次遇到未知命令时log
             self._COMMAND_HANDLERS[cmd] = None
 
     async def _on_receive_popularity(self, popularity: int):
