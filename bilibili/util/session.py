@@ -6,8 +6,6 @@ import functools
 import pickle
 import requests
 
-from selenium import webdriver
-
 from .others import Faker as F
 from ..conf import pickle_path
 
@@ -106,6 +104,8 @@ class Session:
         Argument:
             - name: str, selenium.webdriver.`name`
         '''
+        from selenium import webdriver
+
         self.browser = getattr(webdriver, name)()
         self.browser.get('https://passport.bilibili.com/login')
         input('Please login in >>> ')
