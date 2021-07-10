@@ -4,10 +4,13 @@ __all__ = ('User', 'Video', 'Dynamic', 'Comment', 'FavoriteList')
 
 import collections
 import math
+import re
 import requests
 import retrying
 import time
 import warnings
+
+from bs4 import BeautifulSoup
 
 from ..util.session import session
 from ..util.decorators import lazy_property
@@ -73,10 +76,10 @@ class User:
         keys1, key2 = ('data', 'list', 'vlist'), 'aid'
         for page in self._data(url, count, 30, 'pubdate', 'mid', keys1, key2):
             for id in page:
-                yield Video(id)
+                yield Video(id, info=self.info is not None)
 
 
-    @lazy_property
+    @property
     def number_of_videos(self):
         '''Return the number of videos
         '''
@@ -101,7 +104,7 @@ class User:
                 yield User(id, self.info is not None)
 
 
-    @lazy_property
+    @property
     def number_of_followers(self):
         '''Return the number of followers
         '''
@@ -170,7 +173,7 @@ class User:
             yield FavoriteList(favlist['id'], favlist['title'], favlist['media_count'])
 
 
-    @lazy_property
+    @property
     def number_of_favorites(self):
         url = 'https://api.bilibili.com/x/v3/fav/folder/created/list-all'
         data = requests.get(url, params=dict(up_mid=self.id)).json()
@@ -297,6 +300,7 @@ class Video:
     API:
         - property
             - comments, iterator
+            - tags, iterator
         - function
             - set_info()
     '''
@@ -323,6 +327,51 @@ class Video:
             ...     print(comment)
         '''
         yield from Comment.from_args(self.id)
+
+
+    @property
+    def tags(self):
+        # https://www.bilibili.com/v/channel/{tag_id}
+        url = f'https://www.bilibili.com/video/av{self.id}'
+        pattern = re.compile(r'\d+')
+        soup = BeautifulSoup(session.requests.get(url).content, 'lxml')
+        for tag in soup.find(class_='tag-area').find_all(class_='tag'):
+            btns = tag.find(class_='channel-btns')
+            yield dict(
+                id=int(pattern.findall(btns.find('a').attrs['href'])[0]),
+                title=tag.find(class_='channel-title').text.strip(),
+                description=tuple(x.text for x in tag.find(class_='channel-desc').children),
+                subscribe=btns.find('div').text.strip(),
+            )
+
+
+    def danmaku(self, date=time.strftime('%Y-%m-%d')):
+        warnings.warn('Please login first.', Warning)
+
+        def report(oid, dmid, reason, content=''):
+            '''
+            1：违法违禁，2：色情低俗，3：赌博诈骗，4：人身攻击，5：侵犯隐私，6：垃圾广告
+            7：引战，8：剧透，9：恶意刷屏，10：视频无关，11：其它，12：青少年不良信息
+            '''
+            url = 'https://api.bilibili.com/x/dm/report/add'
+            data = dict(cid=oid, dmid=dmid, reason=reason, csrf=session.session.cookies['bili_jct'])
+            response = session.session.post(url, data=data, headers=dict(referer='https://www.bilibili.com'))
+            return response.json()['code'] == 0
+
+        try:
+            oid = next(
+                re.finditer(r'(?<=cid=)\d+', requests.get(f'https://bilibili.com/av{self.id}').text)
+            ).group()
+        except:
+            return
+        url = 'https://api.bilibili.com/x/v2/dm/history'
+        params = dict(type=1, oid=oid, date=date)
+        soup = BeautifulSoup(session.session.get(url, params=params).content, 'lxml')
+        for danmaku in soup.find_all('d'):
+            data = danmaku.attrs['p'].split(',')
+            f = lambda reason=2, content='': report(oid, data[-1], reason, content)
+            f.__doc__ = report.__doc__
+            yield dict(content=danmaku.text, data=data, report=f)
 
 
     def set_info(self):
