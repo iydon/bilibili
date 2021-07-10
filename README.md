@@ -2,7 +2,7 @@
 
 *Bilibili-utils* 集成了部分的[哔哩哔哩](https://www.bilibili.com/)接口。
 
-# 基本使用（未完善）
+# 基本使用
 ## 安装
 使用 `pip` 进行安装：
 ```shell
@@ -17,12 +17,13 @@ from bilibili.database.model import User, Chat, Contribution, SignIn, Popularity
 from bilibili.database.util import add, get
 # 用户视频模块
 from bilibili.space import User, Video, Dynamic, Comment, FavoriteList
+from bilibili.space.utils import send, search
 # 直播模块
 from bilibili.live import model as blivedm
-from bilibili.live.util import send
+from bilibili.live.util import send, stream, get
 # 其他工具
 from bilibili.util.session import session
-from bilibili.util.voice import playsound, voice_via_baidu, voice_via_google
+from bilibili.util.voice import playsound, voice_via_baidu, voice_via_google, music
 from bilibili.util.others import av2bv, bv2av
 ```
 
