@@ -4,23 +4,21 @@ __all__ = ('playsound', 'voice_via_baidu', 'voice_via_google', 'music')
 
 import execjs
 import hashlib
+import json
+import music_dl
 import os
 import requests
-import subprocess
-import tempfile
-import warnings
 
-from fuzzywuzzy import process
+music_dl.config.init()
 
-from music_dl import config
-from music_dl.source import MusicSource
+from music_dl.addons.netease import netease_search
+from pydub import AudioSegment, playback
+from you_get.extractors.netease import netease_download
 
-from ..conf import voice_path
+from ..conf import music_path, voice_path
 
 
 
-config.init()
-ms = MusicSource()
 ctx = execjs.compile('''
     function TL(a) {
         var k = "";
@@ -64,15 +62,13 @@ ctx = execjs.compile('''
 
 
 
-def playsound(path):
+def playsound(path, format=None):
     '''
-    TODO:
-        Maybe we can consider `playsound.playsound`.
+    Argument:
+        path: str
     '''
-    warnings.warn('It remains to be improved...', DeprecationWarning, stacklevel=2)
-    with tempfile.TemporaryFile('w') as null:
-        subprocess.check_call(['mplayer', path], stdout=null, stderr=null)
-    # os.system(f'mplayer "{path}" &')
+    song = AudioSegment.from_file(path, format=None)
+    playback.play(song)
 
 
 def voice_via_bing(text, lan='zh-CN', spd=3, gender='Female', dirname=voice_path):
@@ -101,9 +97,10 @@ def voice_via_baidu(text, lan='zh', spd=3, dirname=voice_path):
     if not os.path.exists(path):
         url = 'https://fanyi.baidu.com/gettts'
         params = dict(text=text, lan=lan, spd=spd)
-        response = requests.get(url, params=params)
-        with open(path, 'wb') as f:
-            f.write(response.content)
+        content = requests.get(url, params=params).content
+        if content:
+            with open(path, 'wb') as f:
+                f.write(content)
     return path
 
 
@@ -118,19 +115,44 @@ def voice_via_google(text, lan='zh', spd=0.5, dirname=voice_path):
             ie='UTF-8', q=text, tl=lan, total=1, idx=0, textlen=len(text),
             tk=ctx.call('TL', text), client='webapp', prev='input', ttsspeed=spd,
         )
-        response = requests.get(url, params=params)
-        with open(path, 'wb') as f:
-            f.write(response.content)
+        content = requests.get(url, params=params).content
+        if content:
+            with open(path, 'wb') as f:
+                f.write(content)
     return path
 
 
-def music(text):
-    '''Download music via `music_dl`.
+class music:
+    '''Download music via qq and netease
     '''
-    songs = ms.search(text, config.get('source').split(' '))
-    name, _ = process.extractOne(text, map(lambda x: x.name, songs))
-    for song in songs:
-        if song.name == name:
-            if not os.path.exists(name):
-                song.download()
-            return name
+    @classmethod
+    def qq(cls, text, dirname=music_path):
+        songs = requests.get(
+            'https://c.y.qq.com/soso/fcgi-bin/client_search_cp',
+            headers=dict(referer='https://y.qq.com/portal/search.html'),
+            params=dict(w=text, format='json')
+        ).json()
+        for song in songs['data']['song']['list']:
+            data = json.loads(json.loads(
+                requests.post(
+                    'http://www.douqq.com/qqmusic/qqapi.php',
+                    data=dict(mid=song['media_mid'])
+                ).text
+            ))
+            if data['m4a']:
+                authors = '-'.join(s['name'] for s in song['singer'])
+                path = os.path.join(dirname, f'{song["songname"]}-{authors}.m4a')
+                if not os.path.exists(path):
+                    with open(path, 'wb') as f:
+                        f.write(requests.get(data['m4a']).content)
+                return path
+        return ''
+
+    @classmethod
+    def netease(cls, text, dirname=music_path):
+        id = netease_search(text)[0].id
+        files = set(os.listdir(dirname))
+        netease_download(f'https://music.163.com/#/song?id={id}', dirname)
+        for file in set(os.listdir(dirname)).difference(files):
+            return os.path.join(dirname, file)
+        return ''
