@@ -4,7 +4,7 @@ help:
 
 release:
 	rm -rf build dist
-	python setup.py sdist bdist_wheel
+	python setup.py sdist
 	twine upload dist/*
 
 clean:

@@ -3,12 +3,12 @@
 import setuptools
 
 
-with open('README.md', 'r') as f:
+with open('README.md', 'r', encoding='utf-8') as f:
 	long_description = f.read()
 
 setuptools.setup(
 	name='bilibili-utils',
-	version='0.1',
+	version='0.2',
 	author='Iydon Liang',
 	author_email='liangiydon@gmail.com',
 	license='MIT License',
