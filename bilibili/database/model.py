@@ -33,6 +33,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
+    nickname = Column(String, nullable=True, unique=True)
 
     sign_ins = relationship('SignIn', back_populates='user')
     chats = relationship('Chat', back_populates='user')
@@ -48,6 +49,12 @@ class Chat(Base):
     date = Column(Date, nullable=False)
     time = Column(Time, nullable=False)
     is_super = Column(Boolean, default=False)
+    is_admin = Column(Boolean, nullable=True)
+    medal_level = Column(Integer, nullable=True)
+    medal_name = Column(String, nullable=True)
+    medal_roomid = Column(Integer, nullable=True)
+    user_level = Column(Integer, nullable=True)
+    privilege_type = Column(String, nullable=True)
     user_id = Column(Integer, ForeignKey('user.id'))
 
     user = relationship('User', back_populates='chats')
