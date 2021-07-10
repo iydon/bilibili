@@ -20,13 +20,12 @@ def timestamp_to_date_time(timestamp=None):
     )
 
 
-def date_time_to_timestamp(date, time):
-    return int(
-        datetime(
-            date.year, date.month, date.day,
-            time.hour, time.minute, time.second,
-        ).timestamp()
+def date_time_to_timestamp(date, time, to_second=True):
+    dt = datetime(
+        date.year, date.month, date.day,
+        time.hour, time.minute, time.second,
     )
+    return int(dt.timestamp()) if to_second else dt
 
 
 class get:
@@ -44,6 +43,13 @@ class get:
             u.name = name
             add._all()
         return u
+
+    @classmethod
+    def nickname(cls, name):
+        u = cls._by(User, name=name)
+        if u is None or u.nickname is None:
+            return name
+        return u.nickname
 
     @classmethod
     def _compress(cls, data):
@@ -67,9 +73,9 @@ class get:
 
 class add:
     @classmethod
-    def chat(cls, content, user_id, timestamp=None, is_super=False):
+    def chat(cls, content, user_id, timestamp=None, is_super=False, **kwargs):
         date, time = timestamp_to_date_time(timestamp)
-        c = Chat(content=content, date=date, time=time, is_super=is_super, user_id=user_id)
+        c = Chat(content=content, date=date, time=time, is_super=is_super, user_id=user_id, **kwargs)
         cls._all(c)
         return c
 
@@ -115,8 +121,7 @@ class add:
         # 判断取消关注
         for f in get._by(Follower, iter=True):
             if f.is_valid and f.user_id not in user_ids:
-                f.date = today
-                f.is_valid = False
+                f.is_valid, f.date = False, today
                 cls._all()
         # 判断新增关注
         for user_id, name in zip(user_ids, names):
@@ -131,6 +136,9 @@ class add:
             get.user(user_id, name)
             f = Follower(user_id=user_id, is_valid=True, date=today)
             cls._all(f)
+        elif not f.is_valid:
+            f.is_valid, f.date = True, today
+            cls._all()
 
     @classmethod
     def _all(cls, *instances):
